@@ -11,11 +11,6 @@ pub const DEFAULT_PAGE_SIZE: u32 = 50;
 /// Upper bound on the page size.
 pub const MAX_PAGE_SIZE: u32 = 500;
 
-/// Microsoft app registration (client ID) used for Outlook sign-in when
-/// `microsoft_client_id` isn't set in `config.toml`. Set it at build time with
-/// `GATEKEEP_MS_CLIENT_ID=<id> cargo build --release`.
-const BUILTIN_MICROSOFT_CLIENT_ID: Option<&str> = option_env!("GATEKEEP_MS_CLIENT_ID");
-
 /// Directory that holds `config.toml` (and `account.json` if no keychain is available).
 pub fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "gatekeep").map(|d| d.config_dir().to_path_buf())
@@ -66,9 +61,6 @@ pub struct Config {
     pub blocked_senders: Vec<String>,
     /// Address of the account that was shown last; opened first at startup.
     pub last_account: Option<String>,
-    /// Client ID of your Microsoft Entra app registration, needed to sign in to
-    /// Outlook / Hotmail accounts. Overrides the one built into the app.
-    pub microsoft_client_id: Option<String>,
 }
 
 impl Default for Config {
@@ -80,22 +72,11 @@ impl Default for Config {
             rules: Vec::new(),
             blocked_senders: Vec::new(),
             last_account: None,
-            microsoft_client_id: None,
         }
     }
 }
 
 impl Config {
-    /// The Microsoft client ID to sign in with, if one is configured.
-    pub fn microsoft_client_id(&self) -> Option<String> {
-        self.microsoft_client_id
-            .as_deref()
-            .or(BUILTIN_MICROSOFT_CLIENT_ID)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-
     /// Load the config, falling back to defaults if missing.
     /// A parse error is reported so the UI can show it, and defaults are used.
     pub fn load() -> (Self, Option<String>) {

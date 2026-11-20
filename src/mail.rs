@@ -303,8 +303,8 @@ impl MailClient {
     /// Folders an Outlook account-wide search covers: everything selectable
     /// except Deleted Items, Junk and Outlook's internal folders. This mirrors
     /// Gmail's All Mail, which excludes Trash and Spam.
-    fn searchable_folders(&mut self, search: &Search) -> Result<Vec<String>, ApiError> {
-        if search.inbox_only {
+    fn searchable_folders(&mut self, inbox_only: bool) -> Result<Vec<String>, ApiError> {
+        if inbox_only {
             return Ok(vec!["INBOX".into()]);
         }
         let skip_names = ["deleted items", "deleted", "trash", "junk email", "junk", "outbox"];
@@ -336,7 +336,7 @@ impl MailClient {
             Provider::Outlook => {
                 let mut count = 0;
                 let mut found = Vec::new();
-                for folder in self.searchable_folders(search)? {
+                for folder in self.searchable_folders(search.inbox_only)? {
                     self.session.examine(&folder).map_err(map_imap_error)?;
                     let matched = self.verified_search(search)?;
                     count += matched.len();
@@ -375,7 +375,7 @@ impl MailClient {
                 Ok(uids.len())
             }
             Provider::Outlook => {
-                let folders = self.searchable_folders(search)?;
+                let folders = self.searchable_folders(search.inbox_only)?;
                 let n = folders.len().max(1) as f32;
                 let mut moved = 0;
                 for (i, folder) in folders.iter().enumerate() {
@@ -392,6 +392,30 @@ impl MailClient {
                 Ok(moved)
             }
         }
+    }
+
+    /// Move every message in the account to Trash (Gmail: All Mail; Outlook: the
+    /// same folders as an account-wide search). Returns how many were moved.
+    /// `progress(fraction, moved)` is called as it goes.
+    pub fn trash_everything_with_progress(&mut self, progress: &mut dyn FnMut(f32, usize)) -> Result<usize, ApiError> {
+        let trash = self.trash_mailbox()?;
+        let folders = match self.provider {
+            Provider::Gmail => vec![self.special_mailbox(NameAttribute::All, &[])?],
+            Provider::Outlook => self.searchable_folders(false)?,
+        };
+        let n = folders.len().max(1) as f32;
+        let mut moved = 0;
+        for (i, folder) in folders.iter().enumerate() {
+            progress(i as f32 / n, moved);
+            self.session.select(folder).map_err(map_imap_error)?;
+            let mut uids: Vec<u32> = self.session.uid_search("ALL").map_err(map_imap_error)?.into_iter().collect();
+            uids.sort_unstable();
+            let len = uids.len().max(1) as f32;
+            self.move_uids(&uids, &trash, &mut |done| progress((i as f32 + done as f32 / len) / n, moved + done))?;
+            moved += uids.len();
+        }
+        progress(1.0, moved);
+        Ok(moved)
     }
 
     /// Move specific INBOX messages to Trash.
@@ -499,6 +523,7 @@ fn uid_set(uids: &[u32]) -> String {
 /// Turn raw RFC 5322 bytes (full message or headers only) into a [`Message`].
 fn parse_message(parser: &MessageParser, uid: u32, raw: &[u8], unread: bool) -> Message {
     let mut msg = Message {
+        account: String::new(),
         uid,
         message_id: String::new(),
         from: None,

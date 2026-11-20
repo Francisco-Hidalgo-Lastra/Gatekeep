@@ -49,7 +49,17 @@ administrator must allow IMAP and may have to approve the app.
 
 ### Setting up Outlook sign-in
 
-Microsoft sign-in needs an app registration (a free "client ID"). Create one once:
+Microsoft sign-in needs an app registration (a free "client ID"). You enter it in the
+Outlook sign-in form; nothing is read from build settings or config files. Create one once:
+
+> **Personal accounts need their own tenant to register an app.** If you open the Entra
+> admin center with a personal Microsoft account (Outlook, Hotmail, Live), you are placed
+> in Microsoft's shared "Microsoft Services" tenant and see *"Selected user account does
+> not exist in tenant 'Microsoft Services'"*. Create your own tenant first (for example by
+> signing up for a free Azure account, which may ask for a card), or register the app
+> with a work or school account. This only affects registering the app: any personal
+> account can sign in to Gatekeep with the resulting client ID, since the app allows
+> personal Microsoft accounts (step 2).
 
 1. Go to <https://entra.microsoft.com> → **App registrations** → **New registration**.
    Any Microsoft account can do this.
@@ -59,24 +69,12 @@ Microsoft sign-in needs an app registration (a free "client ID"). Create one onc
 3. Under **Authentication**, set **Allow public client flows** to **Yes** and save.
 4. Under **API permissions**, add the delegated **Microsoft Graph** permissions
    `IMAP.AccessAsUser.All`, `offline_access`, `openid`, `email` and `profile`.
-5. Copy the **Application (client) ID** from **Overview**.
+5. Copy the **Application (client) ID** from **Overview** and paste it into the
+   **Microsoft app client ID** field on the Outlook sign-in form.
 
-Then either add it to `config.toml` in Gatekeep's config folder
-(`~/.config/gatekeep/` on Linux, `~/Library/Application Support/gatekeep/` on macOS,
-`%APPDATA%\gatekeep\config\` on Windows; the sign-in form also shows the path):
-
-```toml
-microsoft_client_id = "00000000-0000-0000-0000-000000000000"
-```
-
-or build it into the app, so users don't have to configure anything:
-
-```sh
-GATEKEEP_MS_CLIENT_ID=00000000-0000-0000-0000-000000000000 cargo build --release
-```
-
-The value in `config.toml` wins if both are set. Each Outlook account remembers the
-client ID it signed in with, so changing it later only affects new sign-ins.
+The form shows these steps too. Each Outlook account stores the client ID it signed in
+with alongside its refresh token, so signed-in accounts reopen without asking again, and
+adding another Outlook account pre-fills the field.
 
 ## Several accounts
 
@@ -98,6 +96,10 @@ Outlook's **Deleted Items**, and only when you ask it to:
   sender, subject, age, "only in Inbox", and/or (Gmail only) any extra
   [Gmail search terms](https://support.google.com/mail/answer/7190). It shows how
   many emails match before you confirm. An empty filter is never allowed.
+- **🗑 Delete all email…** trashes every email in the account shown. You must type
+  the address to confirm, and a progress bar blocks the rest of the window until it
+  finishes. Gmail: everything in All Mail (Spam is not included). Outlook: every folder
+  except Deleted Items, Junk and Outbox.
 - **Checkboxes**: tick the boxes on the right of the message list, then
   **🗑 Delete N selected** trashes them. **Select all shown** ticks everything in the
   current view.

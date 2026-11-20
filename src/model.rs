@@ -27,6 +27,9 @@ impl Address {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    /// Address of the account it belongs to (filled in by the worker). UIDs are
+    /// only unique within one account, so the UI keys messages by both.
+    pub account: String,
     /// IMAP UID within INBOX.
     pub uid: u32,
     /// RFC 5322 `Message-ID` without angle brackets (may be empty).
@@ -182,6 +185,7 @@ mod tests {
     #[test]
     fn web_url_searches_by_message_id() {
         let mut m = Message {
+            account: String::new(),
             uid: 7,
             message_id: "abc+1@x.com".into(),
             from: None,

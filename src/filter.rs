@@ -351,6 +351,7 @@ mod tests {
 
     fn msg(from: &str, name: &str, subject: &str, days_old: i64, now: DateTime<Local>) -> Message {
         Message {
+            account: String::new(),
             uid: 1,
             message_id: String::new(),
             from: Some(Address { name: name.into(), email: from.into() }),

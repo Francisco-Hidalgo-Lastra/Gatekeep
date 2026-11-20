@@ -203,6 +203,7 @@ mod tests {
 
     fn msg() -> Message {
         Message {
+            account: String::new(),
             uid: 1,
             message_id: "1@example.com".into(),
             from: Some(addr("Acme Weekly", "news@acme.example")),

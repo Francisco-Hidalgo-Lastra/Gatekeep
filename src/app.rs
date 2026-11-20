@@ -24,6 +24,15 @@ const ROW_HEIGHT: f32 = 66.0;
 
 /// Width reserved at the right edge of a row for its selection checkbox.
 const CHECK_WIDTH: f32 = 28.0;
+/// Where users register the Microsoft app whose client ID Outlook sign-in needs.
+const ENTRA_APP_REGISTRATIONS_URL: &str = "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade";
+
+/// A Microsoft client ID is a GUID: 8-4-4-4-12 hex digits.
+fn is_client_id(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts.iter().zip([8, 4, 4, 4, 12]).all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthState {
@@ -58,11 +67,17 @@ pub struct GatekeepApp {
     /// The blocked-mail cleanup, while it is queued or running. The whole UI is
     /// locked behind a progress window until it finishes.
     sweep: Option<Sweep>,
+    /// The "delete all email" confirmation, while it is open.
+    wipe: Option<WipeConfirm>,
     delete: DeleteDialog,
     blocked: BlockedDialog,
     /// Login form fields. The password is cleared as soon as it is submitted.
     login_email: String,
     login_password: String,
+    /// Microsoft app client ID for Outlook sign-in, typed in the form. Pre-filled
+    /// from an already signed-in Outlook account; nothing is read from build
+    /// settings or config files.
+    login_client_id: String,
     inbox: Inbox,
 }
 
@@ -109,13 +124,23 @@ struct SearchResult {
     sample: Vec<Message>,
 }
 
-/// Progress of the blocked-mail cleanup.
+/// Progress of a long-running job that locks the UI (blocked-mail cleanup,
+/// deleting the whole account).
 struct Sweep {
-    /// `Done` events still to come before the cleanup's own (commands queued
+    title: String,
+    /// Footnote under the progress bar.
+    note: String,
+    /// `Done` events still to come before the job's own (commands queued
     /// ahead of it, plus itself). The worker runs commands in order.
     done_left: usize,
     fraction: f32,
     text: String,
+}
+
+/// The "delete all email" confirmation: the account, and what the user has typed.
+struct WipeConfirm {
+    account: String,
+    typed: String,
 }
 
 /// The "Blocked senders" window and the block confirmation.
@@ -164,10 +189,12 @@ impl GatekeepApp {
             refresh_when_idle: false,
             status: "Checking stored session…",
             sweep: None,
+            wipe: None,
             delete: DeleteDialog::default(),
             blocked: BlockedDialog::default(),
             login_email: String::new(),
             login_password: String::new(),
+            login_client_id: String::new(),
             inbox: Inbox::default(),
         }
     }
@@ -279,6 +306,22 @@ impl GatekeepApp {
         self.send(Command::TrashMessages { uids: vec![uid] }, "Moving to Trash…");
     }
 
+    /// Queue a command that locks the UI behind a progress window until it finishes.
+    fn start_sweep(&mut self, cmd: Command, status: &'static str, title: &str, note: String) {
+        self.send(cmd, status);
+        let ahead = self.in_flight - 1;
+        self.sweep = Some(Sweep {
+            title: title.to_owned(),
+            note,
+            done_left: self.in_flight,
+            fraction: 0.0,
+            text: match ahead {
+                0 => "Starting…".into(),
+                n => format!("Waiting for {n} earlier task{} to finish…", if n == 1 { "" } else { "s" }),
+            },
+        });
+    }
+
     /// Move every ticked message to Trash.
     fn trash_checked(&mut self) {
         let mut uids: Vec<u32> = self.inbox.checked.drain().collect();
@@ -346,6 +389,11 @@ impl GatekeepApp {
                     self.device_code = None;
                     self.adding_account = false;
                     self.login_email.clear();
+                    if self.login_client_id.trim().is_empty()
+                        && let Some(a) = accounts.iter().find(|a| !a.client_id.is_empty())
+                    {
+                        self.login_client_id = a.client_id.clone();
+                    }
                     let changed = self.active_email() != Some(active.as_str());
                     self.auth = AuthState::SignedIn { accounts, active: active.clone(), store };
                     if changed {
@@ -704,26 +752,42 @@ impl GatekeepApp {
         ui.label("For Outlook.com, Hotmail, Live, MSN and Microsoft 365 accounts.");
         ui.weak("Microsoft doesn't allow passwords for this, so you sign in on Microsoft's own page in your browser. Gatekeep never sees your password.");
         ui.add_space(12.0);
-        let client_id = self.config.microsoft_client_id();
+        ui.label("Microsoft app client ID");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.login_client_id)
+                .hint_text("00000000-0000-0000-0000-000000000000")
+                .desired_width(f32::INFINITY),
+        );
+        let client_id = self.login_client_id.trim().to_owned();
+        let valid = is_client_id(&client_id);
+        if !client_id.is_empty() && !valid {
+            ui.colored_label(ui.visuals().warn_fg_color, "A client ID looks like 00000000-0000-0000-0000-000000000000.");
+        }
+        egui::CollapsingHeader::new("How do I get a client ID?")
+            .default_open(client_id.is_empty())
+            .show(ui, |ui| {
+                ui.weak("Microsoft only lets registered apps use IMAP. Register one (free, once):");
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "A personal Microsoft account (Outlook, Hotmail, Live) can't register apps on its own: \
+                     Entra reports \"Selected user account does not exist in tenant 'Microsoft Services'\". \
+                     First create your own tenant (e.g. by signing up for a free Azure account), or register \
+                     the app with a work or school account. The personal account can still sign in to \
+                     Gatekeep afterwards.",
+                );
+                ui.hyperlink_to("1. Open Microsoft Entra → App registrations → New registration ↗", ENTRA_APP_REGISTRATIONS_URL);
+                ui.weak("2. Supported account types: \"Accounts in any organizational directory and personal Microsoft accounts\". No redirect URI.");
+                ui.weak("3. Authentication: set \"Allow public client flows\" to Yes.");
+                ui.weak("4. API permissions: add IMAP.AccessAsUser.All, offline_access, openid, email, profile.");
+                ui.weak("5. Copy the Application (client) ID from Overview and paste it above.");
+            });
+        ui.add_space(12.0);
         let label = if self.signing_in { "Contacting Microsoft…" } else { "Sign in with Microsoft" };
-        let ready = !self.signing_in && client_id.is_some();
-        if ui.add_enabled(ready, Self::primary_button(ui, label)).clicked()
-            && let Some(id) = client_id.clone()
-        {
+        let ready = !self.signing_in && valid;
+        if ui.add_enabled(ready, Self::primary_button(ui, label)).clicked() {
             self.clear_errors();
             self.signing_in = true;
-            self.worker.sign_in_microsoft(id);
-        }
-        if client_id.is_none() {
-            ui.add_space(8.0);
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "Outlook sign-in isn't set up in this build. Add your Microsoft app's client ID as \
-                 microsoft_client_id in config.toml (see the README), then restart Gatekeep.",
-            );
-            if let Some(dir) = crate::config::config_dir() {
-                ui.weak(format!("Config folder: {}", dir.display()));
-            }
+            self.worker.sign_in_microsoft(client_id);
         }
         ui.add_space(8.0);
     }
@@ -779,16 +843,21 @@ impl GatekeepApp {
                 .on_disabled_hover_text("No blocked senders yet");
             if clean.clicked() {
                 let blocked = self.config.blocked_senders.clone();
-                self.send(Command::TrashBlocked { blocked }, "Deleting blocked mail…");
-                let ahead = self.in_flight - 1;
-                self.sweep = Some(Sweep {
-                    done_left: self.in_flight,
-                    fraction: 0.0,
-                    text: match ahead {
-                        0 => "Starting…".into(),
-                        n => format!("Waiting for {n} earlier task{} to finish…", if n == 1 { "" } else { "s" }),
-                    },
-                });
+                self.start_sweep(
+                    Command::TrashBlocked { blocked },
+                    "Deleting blocked mail…",
+                    "Deleting blocked mail",
+                    "Mail from blocked senders and domains is moved to Trash in every account.".into(),
+                );
+            }
+            if let AuthState::SignedIn { active, .. } = &self.auth {
+                let account = active.clone();
+                let wipe = ui
+                    .button(egui::RichText::new("🗑 Delete all email…").color(ui.visuals().error_fg_color))
+                    .on_hover_text("Move every email in this account to Trash");
+                if wipe.clicked() {
+                    self.wipe = Some(WipeConfirm { account, typed: String::new() });
+                }
             }
             let checked = self.inbox.checked.len();
             if checked > 0 {
@@ -1174,22 +1243,40 @@ impl GatekeepApp {
                     );
                     ui.add_space(4.0);
                     let needle = self.blocked.search.trim().to_lowercase();
-                    let mut shown = 0;
-                    // Keep the real index so "✕" removes the right entry while filtering.
-                    for (i, sender) in self.config.blocked_senders.iter().enumerate() {
-                        if !needle.is_empty() && !sender.to_lowercase().contains(&needle) {
-                            continue;
-                        }
-                        shown += 1;
-                        ui.horizontal(|ui| {
-                            if ui.small_button("✕").on_hover_text("Unblock").clicked() {
-                                remove = Some(i);
-                            }
-                            ui.label(sender);
-                        });
-                    }
-                    if shown == 0 {
+                    // Keep the real index so "✕" removes the right entry while sorting and filtering.
+                    let mut entries: Vec<(usize, &String)> = self
+                        .config
+                        .blocked_senders
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| needle.is_empty() || s.to_lowercase().contains(&needle))
+                        .collect();
+                    entries.sort_by_key(|(_, s)| s.to_lowercase());
+                    let (emails, domains): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, s)| s.contains('@'));
+                    if emails.is_empty() && domains.is_empty() {
                         ui.weak("No blocked senders match your search.");
+                    } else {
+                        // Capped height so a long list scrolls inside the window.
+                        egui::ScrollArea::vertical()
+                            .max_height(260.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (title, list) in [("Email addresses", &emails), ("Domains", &domains)] {
+                                    if list.is_empty() {
+                                        continue;
+                                    }
+                                    ui.strong(format!("{title} ({})", list.len()));
+                                    for &(i, sender) in list {
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("✕").on_hover_text("Unblock").clicked() {
+                                                remove = Some(i);
+                                            }
+                                            ui.label(sender);
+                                        });
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            });
                     }
                 }
                 ui.separator();
@@ -1228,13 +1315,60 @@ impl GatekeepApp {
         let Some(sweep) = &self.sweep else { return };
         egui::Modal::new(egui::Id::unique("sweep_progress")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Deleting blocked mail");
+            ui.heading(&sweep.title);
             ui.add_space(6.0);
             ui.add(egui::ProgressBar::new(sweep.fraction).show_percentage().animate(true));
             ui.add_space(4.0);
             ui.label(&sweep.text);
-            ui.weak("Mail from blocked senders and domains is moved to Trash in every account.");
+            ui.weak(&sweep.note);
         });
+    }
+
+    /// Ask before moving the whole account to Trash. The user must type the
+    /// address, so this can't happen by a stray click or Enter key.
+    fn wipe_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = &mut self.wipe else { return };
+        let mut decision = None;
+        egui::Modal::new(egui::Id::unique("wipe_confirm")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Delete all email?");
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Every email in {} will be moved to Trash. This covers the whole account, not only the INBOX.",
+                confirm.account
+            ));
+            ui.add_space(2.0);
+            ui.weak("Nothing is permanently deleted, and mail in Trash can be restored from there.");
+            ui.add_space(8.0);
+            ui.label("Type the address to confirm:");
+            ui.add(
+                egui::TextEdit::singleline(&mut confirm.typed)
+                    .hint_text(confirm.account.as_str())
+                    .desired_width(f32::INFINITY),
+            );
+            let matches = confirm.typed.trim().eq_ignore_ascii_case(confirm.account.trim());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let go = egui::Button::new(egui::RichText::new("Delete all email").color(egui::Color32::WHITE))
+                    .fill(ui.visuals().error_fg_color);
+                if ui.add_enabled(matches, go).clicked() {
+                    decision = Some(true);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    decision = Some(false);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                if let Some(confirm) = self.wipe.take() {
+                    let note = format!("Every email in {} is being moved to Trash.", confirm.account);
+                    self.start_sweep(Command::TrashEverything, "Deleting all email…", "Deleting all email", note);
+                }
+            }
+            Some(false) => self.wipe = None,
+            None => {}
+        }
     }
 
     /// Ask before blocking, since it immediately trashes existing mail.
@@ -1455,5 +1589,20 @@ impl eframe::App for GatekeepApp {
         let ctx = ui.ctx().clone();
         self.toasts_ui(&ctx);
         self.sweep_window(&ctx);
+        self.wipe_confirm_window(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_client_ids() {
+        assert!(is_client_id("0a1B2c3d-0000-4fFf-8888-123456789abc"));
+        assert!(!is_client_id(""));
+        assert!(!is_client_id("0a1b2c3d-0000-4fff-8888-123456789ab"));
+        assert!(!is_client_id("0a1b2c3d00004fff8888123456789abc"));
+        assert!(!is_client_id("0a1b2c3d-0000-4fff-8888-123456789abz"));
     }
 }

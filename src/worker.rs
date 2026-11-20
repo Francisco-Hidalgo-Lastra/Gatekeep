@@ -4,7 +4,10 @@
 //! thread never blocks on I/O.
 //!
 //! Several accounts (Gmail and Outlook, mixed) can be signed in at once. One of
-//! them is *active*: its INBOX is synced and shown, and search/delete act on it.
+//! them is *active*: [`Command::Sync`] and [`Command::LoadOlder`] act on it.
+//! [`Command::SyncAll`] syncs every account's INBOX for the combined view.
+//! Commands that delete name their account explicitly, so they can't hit the
+//! wrong one if the view changed while they waited in the queue.
 //! Blocked senders are trashed in every signed-in account on each sync.
 
 use std::collections::HashMap;
@@ -34,16 +37,22 @@ pub enum Command {
     /// Trash blocked-sender mail in every account, then bring the active INBOX up to date.
     /// `known` are the UIDs already loaded in the active account.
     Sync { known: Vec<u32>, page: u32, blocked: Vec<String> },
+    /// Trash blocked-sender mail in every account, then bring every account's INBOX
+    /// up to date, keeping at most `page` messages each. `known` are the UIDs already
+    /// loaded, per account address.
+    SyncAll { known: Vec<(String, Vec<u32>)>, page: u32, blocked: Vec<String> },
     /// Load up to `page` messages older than UID `oldest` in the active account.
     LoadOlder { oldest: u32, page: u32 },
-    /// Count messages matching a search (for the delete preview).
-    Search { search: Search },
-    /// Move every message matching a search to Trash.
-    TrashMatching { search: Search },
-    /// Move specific INBOX messages of the active account to Trash.
-    TrashMessages { uids: Vec<u32> },
+    /// Count messages in `account` matching a search (for the delete preview).
+    Search { account: String, search: Search },
+    /// Move every message in `account` matching a search to Trash.
+    TrashMatching { account: String, search: Search },
+    /// Move specific INBOX messages of `account` to Trash.
+    TrashMessages { account: String, uids: Vec<u32> },
     /// Trash blocked-sender mail in every account now, and report the count even if zero.
     TrashBlocked { blocked: Vec<String> },
+    /// Move every message in `account` to Trash. The UI asks for confirmation first.
+    TrashEverything { account: String },
 }
 
 /// A signed-in account, as the UI sees it (no secrets).
@@ -51,6 +60,9 @@ pub enum Command {
 pub struct AccountInfo {
     pub email: String,
     pub provider: Provider,
+    /// Outlook only: the Microsoft client ID it signed in with (not a secret).
+    /// Pre-fills the sign-in form when adding another Outlook account.
+    pub client_id: String,
 }
 
 pub enum Event {
@@ -67,6 +79,8 @@ pub enum Event {
     /// `account` says which INBOX the result belongs to, so a late result for a
     /// previously shown account can be ignored.
     Synced { account: String, sync: InboxSync },
+    /// One account's part of a [`Command::SyncAll`].
+    SyncedAll { account: String, sync: InboxSync },
     Older { account: String, messages: Vec<Message>, total: usize },
     SearchResult { search: Search, count: usize, sample: Vec<Message> },
     /// Messages were moved to Trash. `uids` are INBOX UIDs, when known.
@@ -186,7 +200,7 @@ impl Worker {
         let accounts = self
             .accounts
             .iter()
-            .map(|a| AccountInfo { email: a.email.clone(), provider: a.provider })
+            .map(|a| AccountInfo { email: a.email.clone(), provider: a.provider, client_id: a.client_id.clone() })
             .collect();
         self.emit(Event::SignedIn { accounts, active, store: self.store });
     }
@@ -268,35 +282,39 @@ impl Worker {
                     self.announce();
                     return;
                 };
-                if let Some(trashed) = self.trash_blocked(&blocked, false)
-                    && trashed > 0
-                {
-                    self.emit(Event::Trashed {
-                        count: trashed,
-                        uids: Vec::new(),
-                        what: "from blocked senders".into(),
-                        resync: false,
-                    });
-                }
-                if let Some(sync) = self.with_account(&active, |c| c.sync_inbox(&known, page)) {
+                self.trash_blocked_quietly(&blocked);
+                if let Some(mut sync) = self.with_account(&active, |c| c.sync_inbox(&known, page)) {
+                    tag(&mut sync.new, &active);
                     self.emit(Event::Synced { account: active, sync });
+                }
+            }
+            Command::SyncAll { known, page, blocked } => {
+                self.trash_blocked_quietly(&blocked);
+                for email in self.emails() {
+                    let known = known.iter().find(|(a, _)| *a == email).map_or(&[][..], |(_, k)| k.as_slice());
+                    // One account failing (e.g. offline) is reported and the others still sync.
+                    if let Some(mut sync) = self.with_account(&email, |c| c.sync_inbox(known, page)) {
+                        tag(&mut sync.new, &email);
+                        self.emit(Event::SyncedAll { account: email, sync });
+                    }
                 }
             }
             Command::LoadOlder { oldest, page } => {
                 if let Some(account) = self.active.clone()
-                    && let Some((messages, total)) =
+                    && let Some((mut messages, total)) =
                         self.with_account(&account, |c| c.fetch_older(oldest, page))
                 {
+                    tag(&mut messages, &account);
                     self.emit(Event::Older { account, messages, total });
                 }
             }
-            Command::Search { search } => {
-                if let Some((count, sample)) = self.with_client(|c| c.search_all_mail(&search, 5)) {
+            Command::Search { account, search } => {
+                if let Some((count, sample)) = self.with_account(&account, |c| c.search_all_mail(&search, 5)) {
                     self.emit(Event::SearchResult { search, count, sample });
                 }
             }
-            Command::TrashMatching { search } => {
-                if let Some(count) = self.with_client(|c| c.trash_matching(&search)) {
+            Command::TrashMatching { account, search } => {
+                if let Some(count) = self.with_account(&account, |c| c.trash_matching(&search)) {
                     log::info!("trashed {count} messages matching a search");
                     self.emit(Event::Trashed {
                         count,
@@ -316,8 +334,27 @@ impl Worker {
                     });
                 }
             }
-            Command::TrashMessages { uids } => {
-                if let Some(count) = self.with_client(|c| c.trash_inbox_uids(&uids)) {
+            Command::TrashEverything { account } => {
+                // Same progress plumbing as trash_blocked: the closure can't borrow self.
+                let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+                let mut progress = |fraction: f32, moved: usize| {
+                    let s = if moved == 1 { "" } else { "s" };
+                    let text = format!("{moved} email{s} moved to Trash so far");
+                    let _ = tx.send(Event::Progress { fraction, text });
+                    ctx.request_repaint();
+                };
+                if let Some(count) = self.with_account(&account, |c| c.trash_everything_with_progress(&mut progress)) {
+                    log::info!("trashed all {count} messages in the account");
+                    self.emit(Event::Trashed {
+                        count,
+                        uids: Vec::new(),
+                        what: format!("from {account}"),
+                        resync: true,
+                    });
+                }
+            }
+            Command::TrashMessages { account, uids } => {
+                if let Some(count) = self.with_account(&account, |c| c.trash_inbox_uids(&uids)) {
                     self.emit(Event::Trashed {
                         count,
                         uids,
@@ -326,6 +363,20 @@ impl Worker {
                     });
                 }
             }
+        }
+    }
+
+    /// [`Worker::trash_blocked`] before a sync: no progress, and a notice only if something moved.
+    fn trash_blocked_quietly(&mut self, blocked: &[String]) {
+        if let Some(trashed) = self.trash_blocked(blocked, false)
+            && trashed > 0
+        {
+            self.emit(Event::Trashed {
+                count: trashed,
+                uids: Vec::new(),
+                what: "from blocked senders".into(),
+                resync: false,
+            });
         }
     }
 
@@ -422,17 +473,6 @@ impl Worker {
         }
     }
 
-    /// Run `f` on the active account. See [`Worker::with_account`].
-    fn with_client<T>(&mut self, f: impl FnOnce(&mut MailClient) -> Result<T, ApiError>) -> Option<T> {
-        match self.active.clone() {
-            Some(email) => self.with_account(&email, f),
-            None => {
-                self.announce();
-                None
-            }
-        }
-    }
-
     /// Run `f` on a fresh connection to one account. Errors are reported to the UI
     /// and give `None`; rejected credentials forget that account.
     fn with_account<T>(&mut self, email: &str, f: impl FnOnce(&mut MailClient) -> Result<T, ApiError>) -> Option<T> {
@@ -491,6 +531,13 @@ impl Worker {
         for e in errors {
             self.error(e, false);
         }
+    }
+}
+
+/// Mark fetched messages as belonging to `account`.
+fn tag(messages: &mut [Message], account: &str) {
+    for m in messages {
+        m.account = account.to_owned();
     }
 }
 
