@@ -5,6 +5,8 @@ Microsoft 365) on the desktop, built with Rust and egui.
 It shows your inbox without clutter and filters it with rules you define, and it
 can clear out unwanted mail in bulk. It never sends mail or marks it as read.
 
+![Gatekeep showing an inbox, a selected message and the delete toolbar](docs/screenshot.png)
+
 ## Run
 
 ```sh
@@ -82,6 +84,13 @@ To add another account (Gmail or Outlook), click **+ Add account** in the top ba
 Once several accounts are signed in, pick the one to show from the account menu in
 the top bar. Each account has its own inbox, but the blocked-senders list is shared
 by all of them.
+
+Choose **All accounts** in the same menu to see every account's inbox in one list,
+newest first: the newest 50 emails from each account. Each row shows which account it
+belongs to, and deleting (one email, ticked emails, or "Delete all from sender") acts
+on that email's own account. **Delete emails…**, **Delete all email…** and **Sign out**
+need a single account, so pick one first. **Load more** isn't offered in this view.
+Gatekeep remembers the choice for the next start.
 
 ### What Gatekeep changes
 

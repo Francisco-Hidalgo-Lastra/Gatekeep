@@ -61,6 +61,8 @@ pub struct Config {
     pub blocked_senders: Vec<String>,
     /// Address of the account that was shown last; opened first at startup.
     pub last_account: Option<String>,
+    /// Show every account's INBOX in one list instead of only `last_account`'s.
+    pub show_all_accounts: bool,
 }
 
 impl Default for Config {
@@ -72,6 +74,7 @@ impl Default for Config {
             rules: Vec::new(),
             blocked_senders: Vec::new(),
             last_account: None,
+            show_all_accounts: false,
         }
     }
 }

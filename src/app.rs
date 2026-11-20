@@ -24,6 +24,16 @@ const ROW_HEIGHT: f32 = 66.0;
 
 /// Width reserved at the right edge of a row for its selection checkbox.
 const CHECK_WIDTH: f32 = 28.0;
+
+/// The "All accounts" view shows at most this many of the newest INBOX emails per account.
+const ALL_ACCOUNTS_PAGE: u32 = 50;
+
+/// Identifies a message across accounts: IMAP UIDs are only unique within one.
+type MsgKey = (String, u32);
+
+fn key(m: &Message) -> MsgKey {
+    (m.account.clone(), m.uid)
+}
 /// Where users register the Microsoft app whose client ID Outlook sign-in needs.
 const ENTRA_APP_REGISTRATIONS_URL: &str = "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade";
 
@@ -78,6 +88,8 @@ pub struct GatekeepApp {
     /// from an already signed-in Outlook account; nothing is read from build
     /// settings or config files.
     login_client_id: String,
+    /// Showing the combined INBOX of every account instead of the active one.
+    all_accounts: bool,
     inbox: Inbox,
 }
 
@@ -88,11 +100,11 @@ struct Inbox {
     messages: Vec<Message>,
     /// `verdicts[i]` is the rule verdict for `messages[i]`.
     verdicts: Vec<Verdict>,
-    /// IMAP UID of the selected message.
-    selected: Option<u32>,
-    /// UIDs of the messages ticked for a bulk delete.
-    checked: HashSet<u32>,
-    /// Number of messages in the INBOX on the server.
+    /// The selected message.
+    selected: Option<MsgKey>,
+    /// The messages ticked for a bulk delete.
+    checked: HashSet<MsgKey>,
+    /// Number of messages in the INBOX on the server (single-account view only).
     total: usize,
     /// When the last refresh finished (wall clock for display, monotonic for auto-refresh).
     updated: Option<(DateTime<Local>, Instant)>,
@@ -104,8 +116,13 @@ impl Inbox {
         (0..self.messages.len()).filter(|&i| !self.verdicts[i].hidden).collect()
     }
 
-    fn find(&self, uid: u32) -> Option<usize> {
-        self.messages.iter().position(|m| m.uid == uid)
+    fn find(&self, k: &MsgKey) -> Option<usize> {
+        self.messages.iter().position(|m| m.uid == k.1 && m.account == k.0)
+    }
+
+    /// Accounts that have messages loaded.
+    fn account_count(&self) -> usize {
+        self.messages.iter().map(|m| m.account.as_str()).collect::<HashSet<_>>().len()
     }
 }
 
@@ -113,6 +130,8 @@ impl Inbox {
 #[derive(Default)]
 struct DeleteDialog {
     open: bool,
+    /// The account searched and trashed in.
+    account: String,
     filter: DeleteFilter,
     /// Last search result; only valid while its query equals the current one.
     result: Option<SearchResult>,
@@ -157,11 +176,11 @@ struct BlockedDialog {
 
 /// Something the user asked for in the reading pane.
 enum PaneAction {
-    Trash(u32),
-    /// Trash every email from this address right away.
-    DeleteFrom(String),
-    /// Open the "Delete emails" window pre-filled with this address.
-    ReviewFrom(String),
+    Trash(MsgKey),
+    /// Trash every email from this address (second) in this account (first) right away.
+    DeleteFrom(String, String),
+    /// Open the "Delete emails" window for this account (first), pre-filled with this address.
+    ReviewFrom(String, String),
     Block(String),
 }
 
@@ -175,6 +194,7 @@ impl GatekeepApp {
             crate::config::ThemeChoice::Dark => egui::ThemePreference::Dark,
         });
         let worker = worker::spawn(cc.egui_ctx.clone());
+        let all_accounts = config.show_all_accounts;
         worker.send(Command::Restore { prefer: config.last_account.clone() });
         Self {
             config,
@@ -195,6 +215,7 @@ impl GatekeepApp {
             login_email: String::new(),
             login_password: String::new(),
             login_client_id: String::new(),
+            all_accounts,
             inbox: Inbox::default(),
         }
     }
@@ -211,12 +232,12 @@ impl GatekeepApp {
         }
     }
 
-    /// Provider of the account whose INBOX is shown.
-    fn active_provider(&self) -> Provider {
+    /// Provider of a signed-in account.
+    fn provider_of(&self, email: &str) -> Provider {
         match &self.auth {
-            AuthState::SignedIn { accounts, active, .. } => accounts
+            AuthState::SignedIn { accounts, .. } => accounts
                 .iter()
-                .find(|a| &a.email == active)
+                .find(|a| a.email == email)
                 .map_or(Provider::Gmail, |a| a.provider),
             _ => Provider::Gmail,
         }
@@ -237,15 +258,23 @@ impl GatekeepApp {
         self.worker.send(cmd);
     }
 
-    /// Trash mail from blocked senders in every account, then fetch new INBOX mail.
+    /// Trash mail from blocked senders in every account, then fetch new INBOX mail
+    /// for the current view.
     fn refresh(&mut self) {
-        let known = self.inbox.messages.iter().map(|m| m.uid).collect();
-        let cmd = Command::Sync {
-            known,
-            page: self.config.page_size,
-            blocked: self.config.blocked_senders.clone(),
-        };
-        self.send(cmd, "Refreshing…");
+        let blocked = self.config.blocked_senders.clone();
+        if self.all_accounts {
+            let mut known: Vec<(String, Vec<u32>)> = Vec::new();
+            for m in &self.inbox.messages {
+                match known.iter_mut().find(|(a, _)| *a == m.account) {
+                    Some((_, uids)) => uids.push(m.uid),
+                    None => known.push((m.account.clone(), vec![m.uid])),
+                }
+            }
+            self.send(Command::SyncAll { known, page: ALL_ACCOUNTS_PAGE, blocked }, "Refreshing all accounts…");
+        } else {
+            let known = self.inbox.messages.iter().map(|m| m.uid).collect();
+            self.send(Command::Sync { known, page: self.config.page_size, blocked }, "Refreshing…");
+        }
     }
 
     fn load_older(&mut self) {
@@ -262,8 +291,8 @@ impl GatekeepApp {
         } else {
             inbox.messages.retain(|m| !sync.removed.contains(&m.uid));
             for (uid, unread) in sync.unread {
-                if let Some(i) = inbox.find(uid) {
-                    inbox.messages[i].unread = unread;
+                if let Some(m) = inbox.messages.iter_mut().find(|m| m.uid == uid) {
+                    m.unread = unread;
                 }
             }
             inbox.messages.extend(sync.new);
@@ -273,37 +302,64 @@ impl GatekeepApp {
         self.messages_changed();
     }
 
+    /// Merge one account's part of the combined view, keeping its newest
+    /// [`ALL_ACCOUNTS_PAGE`] messages.
+    fn apply_sync_all(&mut self, account: &str, sync: InboxSync) {
+        let inbox = &mut self.inbox;
+        if sync.replace {
+            inbox.messages.retain(|m| m.account != account);
+        } else {
+            inbox.messages.retain(|m| m.account != account || !sync.removed.contains(&m.uid));
+            for (uid, unread) in sync.unread {
+                if let Some(m) = inbox.messages.iter_mut().find(|m| m.account == account && m.uid == uid) {
+                    m.unread = unread;
+                }
+            }
+        }
+        inbox.messages.extend(sync.new);
+        // New mail pushes the oldest out. UIDs grow with arrival, so the lowest go.
+        let mut uids: Vec<u32> = inbox.messages.iter().filter(|m| m.account == account).map(|m| m.uid).collect();
+        if uids.len() > ALL_ACCOUNTS_PAGE as usize {
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            let cutoff = uids[ALL_ACCOUNTS_PAGE as usize - 1];
+            inbox.messages.retain(|m| m.account != account || m.uid >= cutoff);
+        }
+        inbox.updated = Some((Local::now(), Instant::now()));
+        self.messages_changed();
+    }
+
     /// Re-sort, re-run the rules, and drop a selection that no longer exists.
     fn messages_changed(&mut self) {
         let inbox = &mut self.inbox;
         inbox.messages.sort_by_key(|m| std::cmp::Reverse(m.date));
-        inbox.messages.dedup_by_key(|m| m.uid);
+        inbox.messages.dedup_by(|a, b| a.uid == b.uid && a.account == b.account);
         inbox.verdicts = inbox.messages.iter().map(|m| rules::evaluate(&self.config.rules, m)).collect();
-        if let Some(sel) = inbox.selected
+        if let Some(sel) = &inbox.selected
             && inbox.find(sel).is_none()
         {
             inbox.selected = None;
         }
-        let present: HashSet<u32> = inbox.messages.iter().map(|m| m.uid).collect();
-        inbox.checked.retain(|uid| present.contains(uid));
+        let present: HashSet<MsgKey> = inbox.messages.iter().map(key).collect();
+        inbox.checked.retain(|k| present.contains(k));
     }
 
     /// Move one INBOX message to Trash and select the next one in the view.
-    fn trash_message(&mut self, uid: u32) {
+    fn trash_message(&mut self, k: MsgKey) {
         let visible = self.inbox.visible();
-        if self.inbox.selected == Some(uid) {
-            let pos = visible.iter().position(|&i| self.inbox.messages[i].uid == uid);
+        if self.inbox.selected.as_ref() == Some(&k) {
+            let pos = visible.iter().position(|&i| key(&self.inbox.messages[i]) == k);
             self.inbox.selected = pos
                 .and_then(|p| visible.get(p + 1).or_else(|| p.checked_sub(1).and_then(|q| visible.get(q))))
-                .map(|&i| self.inbox.messages[i].uid);
+                .map(|&i| key(&self.inbox.messages[i]));
         }
         // Remove it right away; the worker reports an error if the move fails.
-        if let Some(i) = self.inbox.find(uid) {
+        if let Some(i) = self.inbox.find(&k) {
             self.inbox.messages.remove(i);
             self.inbox.total = self.inbox.total.saturating_sub(1);
             self.messages_changed();
         }
-        self.send(Command::TrashMessages { uids: vec![uid] }, "Moving to Trash…");
+        let (account, uid) = k;
+        self.send(Command::TrashMessages { account, uids: vec![uid] }, "Moving to Trash…");
     }
 
     /// Queue a command that locks the UI behind a progress window until it finishes.
@@ -322,19 +378,28 @@ impl GatekeepApp {
         });
     }
 
-    /// Move every ticked message to Trash.
+    /// Move every ticked message to Trash, with one command per account.
     fn trash_checked(&mut self) {
-        let mut uids: Vec<u32> = self.inbox.checked.drain().collect();
-        if uids.is_empty() {
+        let checked: HashSet<MsgKey> = self.inbox.checked.drain().collect();
+        if checked.is_empty() {
             return;
         }
-        uids.sort_unstable();
         let before = self.inbox.messages.len();
         // Remove them right away, as with a single delete.
-        self.inbox.messages.retain(|m| uids.binary_search(&m.uid).is_err());
+        self.inbox.messages.retain(|m| !checked.contains(&key(m)));
         self.inbox.total = self.inbox.total.saturating_sub(before - self.inbox.messages.len());
         self.messages_changed();
-        self.send(Command::TrashMessages { uids }, "Moving to Trash…");
+        let mut by_account: Vec<(String, Vec<u32>)> = Vec::new();
+        for (account, uid) in checked {
+            match by_account.iter_mut().find(|(a, _)| *a == account) {
+                Some((_, uids)) => uids.push(uid),
+                None => by_account.push((account, vec![uid])),
+            }
+        }
+        for (account, mut uids) in by_account {
+            uids.sort_unstable();
+            self.send(Command::TrashMessages { account, uids }, "Moving to Trash…");
+        }
     }
 
     fn save_config(&mut self) {
@@ -351,17 +416,34 @@ impl GatekeepApp {
         }
     }
 
-    /// Show another signed-in account's INBOX.
-    fn switch_account(&mut self, email: String) {
+    /// Show another signed-in account's INBOX, or (`None`) every account's at once.
+    fn switch_account(&mut self, choice: Option<String>) {
         let AuthState::SignedIn { active, .. } = &mut self.auth else { return };
-        if *active == email {
-            return;
+        match choice {
+            None if self.all_accounts => return,
+            None => self.set_all_accounts(true),
+            Some(email) => {
+                if *active == email && !self.all_accounts {
+                    return;
+                }
+                if *active != email {
+                    *active = email.clone();
+                    self.worker.send(Command::Activate(email.clone()));
+                }
+                self.remember_account(&email);
+                self.set_all_accounts(false);
+            }
         }
-        *active = email.clone();
         self.inbox = Inbox::default();
-        self.remember_account(&email);
-        self.worker.send(Command::Activate(email));
         self.refresh();
+    }
+
+    fn set_all_accounts(&mut self, on: bool) {
+        self.all_accounts = on;
+        if self.config.show_all_accounts != on {
+            self.config.show_all_accounts = on;
+            self.save_config();
+        }
     }
 
     /// Kick off a refresh when the auto-refresh interval has passed.
@@ -395,10 +477,30 @@ impl GatekeepApp {
                         self.login_client_id = a.client_id.clone();
                     }
                     let changed = self.active_email() != Some(active.as_str());
+                    let accounts_changed = match &self.auth {
+                        AuthState::SignedIn { accounts: old, .. } => *old != accounts,
+                        _ => true,
+                    };
+                    // The combined view only makes sense with two or more accounts.
+                    let left_all = self.all_accounts && accounts.len() < 2;
+                    if left_all {
+                        self.set_all_accounts(false);
+                        self.inbox = Inbox::default();
+                    }
+                    if self.all_accounts {
+                        // Drop mail from accounts that were removed; fetch newly added ones.
+                        self.inbox.messages.retain(|m| accounts.iter().any(|a| a.email == m.account));
+                        self.messages_changed();
+                    }
+                    let refresh = if self.all_accounts { accounts_changed } else { changed || left_all };
                     self.auth = AuthState::SignedIn { accounts, active: active.clone(), store };
                     if changed {
-                        self.inbox = Inbox::default();
                         self.remember_account(&active);
+                        if !self.all_accounts {
+                            self.inbox = Inbox::default();
+                        }
+                    }
+                    if refresh {
                         self.refresh();
                     }
                 }
@@ -421,13 +523,18 @@ impl GatekeepApp {
                     self.device_code = None;
                 }
                 Event::Synced { account, sync } => {
-                    let shown = self.active_email() == Some(account.as_str());
+                    let shown = !self.all_accounts && self.active_email() == Some(account.as_str());
                     if shown {
                         self.apply_sync(sync);
                     }
                 }
+                Event::SyncedAll { account, sync } => {
+                    if self.all_accounts {
+                        self.apply_sync_all(&account, sync);
+                    }
+                }
                 Event::Older { account, messages, total } => {
-                    let shown = self.active_email() == Some(account.as_str());
+                    let shown = !self.all_accounts && self.active_email() == Some(account.as_str());
                     if shown {
                         self.inbox.messages.extend(messages);
                         self.inbox.total = total;
@@ -509,16 +616,23 @@ impl GatekeepApp {
                 }
                 AuthState::SignedIn { accounts, active, store } => {
                     if accounts.len() > 1 {
-                        let mut chosen = active.clone();
+                        // `None` is the combined view.
+                        let current = if self.all_accounts { None } else { Some(active.clone()) };
+                        let mut chosen = current.clone();
+                        let all_label = format!("All accounts ({})", accounts.len());
                         egui::ComboBox::from_id_salt("account_switch")
-                            .selected_text(active.as_str())
+                            .selected_text(current.as_deref().unwrap_or(&all_label))
                             .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut chosen, None, &all_label).on_hover_text(format!(
+                                    "The newest {ALL_ACCOUNTS_PAGE} INBOX emails from each account, in one list"
+                                ));
+                                ui.separator();
                                 for a in &accounts {
                                     let label = format!("{} ({})", a.email, a.provider.name());
-                                    ui.selectable_value(&mut chosen, a.email.clone(), label);
+                                    ui.selectable_value(&mut chosen, Some(a.email.clone()), label);
                                 }
                             });
-                        if chosen != active {
+                        if chosen != current {
                             self.switch_account(chosen);
                         }
                     } else {
@@ -532,8 +646,9 @@ impl GatekeepApp {
                         self.adding_account = true;
                     }
                     if ui
-                        .button("Sign out")
+                        .add_enabled(!self.all_accounts, egui::Button::new("Sign out"))
                         .on_hover_text(format!("Remove {active} from Gatekeep"))
+                        .on_disabled_hover_text("Choose one account to sign it out")
                         .clicked()
                     {
                         self.worker.send(Command::SignOut(active.clone()));
@@ -830,8 +945,15 @@ impl GatekeepApp {
                 self.save_config();
             }
             ui.separator();
-            if ui.button("🗑 Delete emails…").on_hover_text("Move every email matching a filter to Trash").clicked() {
-                self.delete.open = true;
+            let single = !self.all_accounts;
+            if ui
+                .add_enabled(single, egui::Button::new("🗑 Delete emails…"))
+                .on_hover_text("Move every email matching a filter to Trash")
+                .on_disabled_hover_text("Choose one account to search it")
+                .clicked()
+                && let Some(account) = self.active_email().map(str::to_owned)
+            {
+                self.open_delete(account, DeleteFilter::default());
             }
             let n = self.config.blocked_senders.len();
             if ui.button(format!("⛔ Blocked ({n})…")).clicked() {
@@ -853,8 +975,12 @@ impl GatekeepApp {
             if let AuthState::SignedIn { active, .. } = &self.auth {
                 let account = active.clone();
                 let wipe = ui
-                    .button(egui::RichText::new("🗑 Delete all email…").color(ui.visuals().error_fg_color))
-                    .on_hover_text("Move every email in this account to Trash");
+                    .add_enabled(
+                        single,
+                        egui::Button::new(egui::RichText::new("🗑 Delete all email…").color(ui.visuals().error_fg_color)),
+                    )
+                    .on_hover_text("Move every email in this account to Trash")
+                    .on_disabled_hover_text("Choose one account to delete its email");
                 if wipe.clicked() {
                     self.wipe = Some(WipeConfirm { account, typed: String::new() });
                 }
@@ -886,8 +1012,15 @@ impl GatekeepApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let loaded = self.inbox.messages.len();
-                    ui.weak(format!("{loaded} of {} loaded", self.inbox.total));
-                    if loaded < self.inbox.total {
+                    if self.all_accounts {
+                        let n = self.inbox.account_count();
+                        let s = if n == 1 { "" } else { "s" };
+                        ui.weak(format!("{loaded} from {n} account{s}"))
+                            .on_hover_text(format!("The newest {ALL_ACCOUNTS_PAGE} INBOX emails from each account"));
+                    } else {
+                        ui.weak(format!("{loaded} of {} loaded", self.inbox.total));
+                    }
+                    if !self.all_accounts && loaded < self.inbox.total {
                         let label = format!("Load {} more", self.config.page_size);
                         if ui.button(label).clicked() {
                             self.load_older();
@@ -895,8 +1028,8 @@ impl GatekeepApp {
                     }
                     if !visible.is_empty() && ui.small_button("Select all shown").clicked() {
                         for &i in visible {
-                            let uid = self.inbox.messages[i].uid;
-                            self.inbox.checked.insert(uid);
+                            let k = key(&self.inbox.messages[i]);
+                            self.inbox.checked.insert(k);
                         }
                     }
                 });
@@ -922,9 +1055,9 @@ impl GatekeepApp {
         let typing = ui.ctx().egui_wants_keyboard_input();
         if !typing
             && ui.input(|i| i.key_pressed(egui::Key::Delete))
-            && let Some(uid) = self.inbox.selected
+            && let Some(k) = self.inbox.selected.clone()
         {
-            self.trash_message(uid);
+            self.trash_message(k);
             return;
         }
         let mut scroll_to = None;
@@ -932,12 +1065,13 @@ impl GatekeepApp {
             let pos = self
                 .inbox
                 .selected
-                .and_then(|sel| visible.iter().position(|&i| self.inbox.messages[i].uid == sel));
+                .as_ref()
+                .and_then(|sel| visible.iter().position(|&i| key(&self.inbox.messages[i]) == *sel));
             let next = match pos {
                 Some(p) => (p as i32 + step).clamp(0, visible.len() as i32 - 1) as usize,
                 None => 0,
             };
-            self.inbox.selected = Some(self.inbox.messages[visible[next]].uid);
+            self.inbox.selected = Some(key(&self.inbox.messages[visible[next]]));
             scroll_to = Some(next);
         }
 
@@ -959,23 +1093,25 @@ impl GatekeepApp {
                 for row in rows {
                     let i = visible[row];
                     let msg = &self.inbox.messages[i];
-                    let uid = msg.uid;
-                    let selected = self.inbox.selected == Some(uid);
-                    let mut checked = self.inbox.checked.contains(&uid);
-                    if message_row(ui, msg, &self.inbox.verdicts[i], selected, &mut checked).clicked() {
-                        self.inbox.selected = Some(uid);
+                    let k = key(msg);
+                    let selected = self.inbox.selected.as_ref() == Some(&k);
+                    let was_checked = self.inbox.checked.contains(&k);
+                    let mut checked = was_checked;
+                    let show_account = self.all_accounts;
+                    if message_row(ui, msg, &self.inbox.verdicts[i], selected, &mut checked, show_account).clicked() {
+                        self.inbox.selected = Some(k.clone());
                     }
-                    if checked {
-                        self.inbox.checked.insert(uid);
-                    } else {
-                        self.inbox.checked.remove(&uid);
+                    if checked && !was_checked {
+                        self.inbox.checked.insert(k);
+                    } else if !checked && was_checked {
+                        self.inbox.checked.remove(&k);
                     }
                 }
             });
     }
 
-    fn reading_pane(&self, ui: &mut egui::Ui, account: Option<&str>, provider: Provider) -> Option<PaneAction> {
-        let Some(i) = self.inbox.selected.and_then(|uid| self.inbox.find(uid)) else {
+    fn reading_pane(&self, ui: &mut egui::Ui) -> Option<PaneAction> {
+        let Some(i) = self.inbox.selected.as_ref().and_then(|k| self.inbox.find(k)) else {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() / 2.0 - 40.0);
                 ui.label(egui::RichText::new("📬").size(44.0));
@@ -985,6 +1121,8 @@ impl GatekeepApp {
             return None;
         };
         let msg = &self.inbox.messages[i];
+        let account = msg.account.as_str();
+        let provider = self.provider_of(account);
         let mut action = None;
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -993,22 +1131,22 @@ impl GatekeepApp {
                 .on_hover_text("Move this email to Trash (Delete key)")
                 .clicked()
             {
-                action = Some(PaneAction::Trash(msg.uid));
+                action = Some(PaneAction::Trash(key(msg)));
             }
             if let Some(from) = &msg.from {
                 if ui
                     .button("Delete all from sender")
-                    .on_hover_text(format!("Move every email from {} to Trash", from.email))
+                    .on_hover_text(format!("Move every email from {} in {account} to Trash", from.email))
                     .clicked()
                 {
-                    action = Some(PaneAction::DeleteFrom(from.email.clone()));
+                    action = Some(PaneAction::DeleteFrom(account.to_owned(), from.email.clone()));
                 }
                 if ui
                     .button("Review sender deletion…")
                     .on_hover_text(format!("Open the Delete emails window filled in for {}", from.email))
                     .clicked()
                 {
-                    action = Some(PaneAction::ReviewFrom(from.email.clone()));
+                    action = Some(PaneAction::ReviewFrom(account.to_owned(), from.email.clone()));
                 }
                 let blocked_by = filter::blocked_by(&self.config.blocked_senders, &from.email);
                 if ui
@@ -1062,9 +1200,14 @@ impl GatekeepApp {
             ui.add(egui::Label::new(egui::RichText::new(subject).heading().strong()).wrap());
 
             let recipients = [("To", join(&msg.to)), ("Cc", join(&msg.cc))];
-            if recipients.iter().any(|(_, v)| !v.is_empty()) {
+            if self.all_accounts || recipients.iter().any(|(_, v)| !v.is_empty()) {
                 ui.add_space(8.0);
                 egui::Grid::new("headers").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+                    if self.all_accounts {
+                        ui.weak("Account");
+                        ui.label(format!("{account} ({})", provider.name()));
+                        ui.end_row();
+                    }
                     for (name, value) in recipients {
                         if !value.is_empty() {
                             ui.weak(name);
@@ -1079,7 +1222,7 @@ impl GatekeepApp {
             ui.horizontal_wrapped(|ui| {
                 // Outlook on the web has no link to a message by its Message-ID.
                 if provider == Provider::Gmail
-                    && let Some(url) = msg.web_url(account)
+                    && let Some(url) = msg.web_url(Some(account))
                 {
                     ui.hyperlink_to("Open in Gmail ↗", url);
                 }
@@ -1099,7 +1242,7 @@ impl GatekeepApp {
 
         ui.add_space(10.0);
         egui::ScrollArea::vertical()
-            .id_salt(("body", msg.uid))
+            .id_salt(("body", account, msg.uid))
             .auto_shrink(false)
             .show(ui, |ui| {
                 ui.set_max_width(760.0);
@@ -1115,8 +1258,18 @@ impl GatekeepApp {
         action
     }
 
+    /// Open the "Delete emails" window for one account.
+    fn open_delete(&mut self, account: String, filter: DeleteFilter) {
+        if self.delete.account != account || filter != DeleteFilter::default() {
+            self.delete = DeleteDialog { open: true, account, filter, result: None };
+        } else {
+            self.delete.open = true;
+        }
+    }
+
     fn delete_window(&mut self, ctx: &egui::Context) {
-        let provider = self.active_provider();
+        let account = self.delete.account.clone();
+        let provider = self.provider_of(&account);
         let mut open = self.delete.open;
         let mut send = None;
         egui::Window::new("Delete emails")
@@ -1126,7 +1279,7 @@ impl GatekeepApp {
             .default_width(460.0)
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "Find emails anywhere in the current account (not only the loaded ones) and move them to {}'s {}.",
+                    "Find emails anywhere in {account} (not only the loaded ones) and move them to {}'s {}.",
                     provider.name(),
                     provider.trash_name()
                 ));
@@ -1171,7 +1324,9 @@ impl GatekeepApp {
                 let find = ui.add_enabled(search.is_some(), egui::Button::new("🔍 Find matching emails"));
                 if find.clicked() {
                     self.delete.result = None;
-                    send = search.clone().map(|search| (Command::Search { search }, "Searching…"));
+                    send = search
+                        .clone()
+                        .map(|search| (Command::Search { account: account.clone(), search }, "Searching…"));
                 }
                 if let Some(r) = &self.delete.result {
                     ui.separator();
@@ -1198,7 +1353,8 @@ impl GatekeepApp {
                         )
                         .fill(ui.visuals().error_fg_color);
                         if ui.add(danger).clicked() {
-                            send = Some((Command::TrashMatching { search: r.search.clone() }, "Moving to Trash…"));
+                            let cmd = Command::TrashMatching { account: account.clone(), search: r.search.clone() };
+                            send = Some((cmd, "Moving to Trash…"));
                         }
                         ui.weak(match provider {
                             Provider::Gmail => "Gmail keeps Trash for 30 days, then deletes it permanently.",
@@ -1363,7 +1519,8 @@ impl GatekeepApp {
             Some(true) => {
                 if let Some(confirm) = self.wipe.take() {
                     let note = format!("Every email in {} is being moved to Trash.", confirm.account);
-                    self.start_sweep(Command::TrashEverything, "Deleting all email…", "Deleting all email", note);
+                    let cmd = Command::TrashEverything { account: confirm.account };
+                    self.start_sweep(cmd, "Deleting all email…", "Deleting all email", note);
                 }
             }
             Some(false) => self.wipe = None,
@@ -1421,8 +1578,6 @@ impl GatekeepApp {
     }
 
     fn inbox_ui(&mut self, ui: &mut egui::Ui) {
-        let account = self.active_email().map(str::to_owned);
-        let provider = self.active_provider();
         egui::Panel::top("inbox_toolbar")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 10)))
             .show(ui, |ui| self.inbox_toolbar(ui));
@@ -1436,22 +1591,18 @@ impl GatekeepApp {
             .show(ui, |ui| self.message_list(ui, &visible));
         let action = egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 12)))
-            .show(ui, |ui| self.reading_pane(ui, account.as_deref(), provider))
+            .show(ui, |ui| self.reading_pane(ui))
             .inner;
         match action {
-            Some(PaneAction::Trash(uid)) => self.trash_message(uid),
-            Some(PaneAction::DeleteFrom(email)) => {
+            Some(PaneAction::Trash(k)) => self.trash_message(k),
+            Some(PaneAction::DeleteFrom(account, email)) => {
                 let filter = DeleteFilter { from: email, ..Default::default() };
-                if let Some(search) = filter.search(provider) {
-                    self.send(Command::TrashMatching { search }, "Moving to Trash…");
+                if let Some(search) = filter.search(self.provider_of(&account)) {
+                    self.send(Command::TrashMatching { account, search }, "Moving to Trash…");
                 }
             }
-            Some(PaneAction::ReviewFrom(email)) => {
-                self.delete = DeleteDialog {
-                    open: true,
-                    filter: DeleteFilter { from: email, ..Default::default() },
-                    result: None,
-                };
+            Some(PaneAction::ReviewFrom(account, email)) => {
+                self.open_delete(account, DeleteFilter { from: email, ..Default::default() });
             }
             Some(PaneAction::Block(email)) => match filter::validate_sender(&email) {
                 Ok(s) => self.blocked.confirm = Some(s),
@@ -1474,6 +1625,7 @@ fn message_row(
     verdict: &Verdict,
     selected: bool,
     checked: &mut bool,
+    show_account: bool,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
@@ -1520,13 +1672,17 @@ fn message_row(
             ui.set_max_width(ui.available_width() - CHECK_WIDTH);
             ui.horizontal(|ui| {
                 let date = msg.date.map(short_date).unwrap_or_default();
-                let date_w = 56.0;
-                ui.add_sized(
-                    [ui.available_width() - date_w, 18.0],
-                    egui::Label::new(strong(sender)).truncate().selectable(false),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Date (and in the combined view, the account) on the right; the sender gets the rest.
+                let right_to_left = egui::Layout::right_to_left(egui::Align::Center);
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 18.0), right_to_left, |ui| {
                     ui.add(egui::Label::new(egui::RichText::new(date).small().weak()).selectable(false));
+                    if show_account {
+                        let tag = egui::RichText::new(&msg.account).small().color(accent);
+                        ui.add(egui::Label::new(tag).selectable(false)).on_hover_text("Account");
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(strong(sender)).truncate().selectable(false));
+                    });
                 });
             });
             let subject = if msg.subject.is_empty() { "(no subject)" } else { &msg.subject };
