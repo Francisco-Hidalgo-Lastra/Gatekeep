@@ -138,6 +138,31 @@ headers before counting or deleting it:
 - anything else (e.g. `Amazon`) matches part of the sender's name or address,
 - subjects match case-insensitively, and "older than" uses the message's Date header.
 
+## Summaries and reports (Ollama)
+
+Gatekeep can summarize mail with [Ollama](https://ollama.com), which runs AI models
+on your own computer. Install Ollama and a model (e.g. `ollama pull llama3.2`), keep it
+running, and then:
+
+- **✨ Summarize** in the reading pane writes a few lines on the email shown: what it's
+  about, key facts and dates, anything you're asked to do, and whether it looks like
+  marketing or phishing. **✨ Summarize again** writes a new one.
+- **✨ Report on N listed** in the toolbar writes a briefing on every email in the list
+  (after your rules hide anything): an overview, what needs attention, what's worth
+  knowing, low-value mail grouped by sender, and anything suspicious. Emails you already
+  summarized go in as their summaries. If the list is too long for the model's context,
+  the report covers the newest emails that fit and says how many.
+
+Text appears as the model writes it, and **Stop** cancels. Summaries run on their own
+queue, so they never hold up refreshing or deleting. AI can get details wrong, so check
+the email before acting on it.
+
+**⚙ Ollama…** sets the server (default `http://localhost:11434`) and the model (default:
+the first one installed). They're saved under `[ollama]` in `config.toml`. The context
+size is picked automatically: as much as the model supports, up to 16,384 tokens, so
+reports fit more emails without the memory cost of a model's full window. Email text is sent only to that server, so keep it on `localhost` if
+your mail should stay on your computer.
+
 ## Loading mail
 
 Gatekeep loads the newest 50 emails, and **Load 50 more** fetches older ones.

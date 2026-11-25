@@ -7,7 +7,7 @@ Outlook/Hotmail (IMAP + OAuth device code). See `README.md` for user-facing beha
 
 - Run: `cargo run --release`
 - Check: `cargo check` (8 pre-existing dead-code warnings in `src/rules.rs`; not ours)
-- No tests exist yet.
+- Test: `cargo test`. `cargo test -- --ignored ollama` also hits a local Ollama.
 - The repo has no commits yet (branch `master`). Don't commit unless asked.
 
 ## Architecture
@@ -26,6 +26,11 @@ Outlook/Hotmail (IMAP + OAuth device code). See `README.md` for user-facing beha
 - Exception: "🧹 Delete blocked mail" (`Command::TrashBlocked`) locks the whole UI behind a
   progress modal (`App.sweep`, `sweep_window()`) until its own `Done` arrives. The worker sends
   `Event::Progress` for it only.
+- `src/ollama.rs` is the exception to "all I/O in `worker.rs`": it runs Ollama requests
+  (summaries, inbox report) on its own thread with its own queue (`AiCommand`/`AiEvent`),
+  so a slow generation never holds up mail commands. It doesn't touch `in_flight`.
+  UI state for it is `App.ai`. Results stream in as `AiEvent::Chunk`; a `JobId` ties them
+  to a summary or the report, and `AiHandle::stop` cancels one.
 - Other modules: `auth.rs` (credentials, keychain fallback), `oauth.rs` (Microsoft
   device code), `mail.rs` (IMAP client), `filter.rs` (delete/blocked-sender search
   and validation), `rules.rs` (display rules), `config.rs`, `model.rs`, `theme.rs`.

@@ -63,6 +63,22 @@ pub struct Config {
     pub last_account: Option<String>,
     /// Show every account's INBOX in one list instead of only `last_account`'s.
     pub show_all_accounts: bool,
+    pub ollama: OllamaConfig,
+}
+
+/// Where summaries and reports are generated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OllamaConfig {
+    pub url: String,
+    /// Model name; empty uses the first installed one.
+    pub model: String,
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self { url: crate::ollama::DEFAULT_URL.into(), model: String::new() }
+    }
 }
 
 impl Default for Config {
@@ -75,6 +91,7 @@ impl Default for Config {
             blocked_senders: Vec::new(),
             last_account: None,
             show_all_accounts: false,
+            ollama: OllamaConfig::default(),
         }
     }
 }

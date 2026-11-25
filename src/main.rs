@@ -4,6 +4,7 @@ mod config;
 mod filter;
 mod mail;
 mod oauth;
+mod ollama;
 mod model;
 mod rules;
 mod theme;

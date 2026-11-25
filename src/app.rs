@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Local};
@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::filter::{self, DeleteFilter, Search};
 use crate::mail::InboxSync;
 use crate::model::Message;
+use crate::ollama::{self, AiCommand, AiEvent, AiHandle, JobId};
 use crate::rules::{self, Verdict};
 use crate::theme;
 use crate::worker::{self, AccountInfo, Command, Event, WorkerHandle};
@@ -91,6 +92,68 @@ pub struct GatekeepApp {
     /// Showing the combined INBOX of every account instead of the active one.
     all_accounts: bool,
     inbox: Inbox,
+    ai: Ai,
+}
+
+/// Summaries, the inbox report, and the Ollama settings window.
+struct Ai {
+    /// Ollama runs on its own thread, so these never wait behind mail commands.
+    handle: AiHandle,
+    last_job: JobId,
+    summaries: HashMap<MsgKey, AiText>,
+    report: Option<Report>,
+    report_open: bool,
+    settings_open: bool,
+    /// Installed models from the last check, or why it failed.
+    models: Option<Result<Vec<String>, String>>,
+    checking_models: bool,
+}
+
+impl Ai {
+    fn text_mut(&mut self, job: JobId) -> Option<&mut AiText> {
+        if let Some(r) = self.report.as_mut().filter(|r| r.ai.job == job) {
+            return Some(&mut r.ai);
+        }
+        self.summaries.values_mut().find(|t| t.job == job)
+    }
+}
+
+/// What the model is writing or wrote: one email's summary, or the report.
+struct AiText {
+    job: JobId,
+    /// The model writing it, once Ollama has started.
+    model: String,
+    text: String,
+    state: AiState,
+}
+
+#[derive(PartialEq, Eq)]
+enum AiState {
+    /// Queued, or Ollama is loading the model.
+    Waiting,
+    Writing,
+    Done,
+    Stopped,
+    Failed(String),
+}
+
+impl AiText {
+    fn new(job: JobId) -> Self {
+        Self { job, model: String::new(), text: String::new(), state: AiState::Waiting }
+    }
+
+    fn active(&self) -> bool {
+        matches!(self.state, AiState::Waiting | AiState::Writing)
+    }
+}
+
+/// The report on every email listed when it was asked for.
+struct Report {
+    ai: AiText,
+    /// The emails listed at the time, newest first.
+    keys: Vec<MsgKey>,
+    /// How many of them (the newest) fit in the model's context, once it started.
+    covered: Option<usize>,
 }
 
 /// The fetched INBOX and what the user is looking at.
@@ -182,6 +245,9 @@ enum PaneAction {
     /// Open the "Delete emails" window for this account (first), pre-filled with this address.
     ReviewFrom(String, String),
     Block(String),
+    Summarize(MsgKey),
+    StopAi(JobId),
+    AiSettings,
 }
 
 impl GatekeepApp {
@@ -217,6 +283,16 @@ impl GatekeepApp {
             login_client_id: String::new(),
             all_accounts,
             inbox: Inbox::default(),
+            ai: Ai {
+                handle: ollama::spawn(cc.egui_ctx.clone()),
+                last_job: 0,
+                summaries: HashMap::new(),
+                report: None,
+                report_open: false,
+                settings_open: false,
+                models: None,
+                checking_models: false,
+            },
         }
     }
 
@@ -341,6 +417,117 @@ impl GatekeepApp {
         }
         let present: HashSet<MsgKey> = inbox.messages.iter().map(key).collect();
         inbox.checked.retain(|k| present.contains(k));
+        let ai = &mut self.ai;
+        ai.summaries.retain(|k, t| {
+            let keep = present.contains(k);
+            if !keep && t.active() {
+                ai.handle.stop(t.job);
+            }
+            keep
+        });
+    }
+
+    /// Queue a request to Ollama with the current settings.
+    fn generate(&mut self, task: ollama::Task) -> JobId {
+        self.ai.last_job += 1;
+        let job = self.ai.last_job;
+        let o = &self.config.ollama;
+        self.ai.handle.send(AiCommand::Generate {
+            job,
+            url: o.url.clone(),
+            model: o.model.clone(),
+            task,
+        });
+        job
+    }
+
+    /// Summarize one email, replacing any earlier summary of it.
+    fn summarize(&mut self, k: MsgKey) {
+        let Some(i) = self.inbox.find(&k) else { return };
+        if let Some(old) = self.ai.summaries.get(&k).filter(|t| t.active()) {
+            self.ai.handle.stop(old.job);
+        }
+        let job = self.generate(ollama::Task::Summary(self.inbox.messages[i].clone()));
+        self.ai.summaries.insert(k, AiText::new(job));
+    }
+
+    /// Write a report on every email in the list, reusing finished summaries.
+    fn start_report(&mut self) {
+        if let Some(old) = self.ai.report.as_ref().filter(|r| r.ai.active()) {
+            self.ai.handle.stop(old.ai.job);
+        }
+        let visible = self.inbox.visible();
+        if visible.is_empty() {
+            return;
+        }
+        let items: Vec<(Message, Option<String>)> = visible
+            .iter()
+            .map(|&i| {
+                let m = &self.inbox.messages[i];
+                let summary = self.ai.summaries.get(&key(m)).filter(|t| t.state == AiState::Done);
+                (m.clone(), summary.map(|t| t.text.clone()))
+            })
+            .collect();
+        let keys = visible.iter().map(|&i| key(&self.inbox.messages[i])).collect();
+        let job = self.generate(ollama::Task::Report(items));
+        self.ai.report = Some(Report { ai: AiText::new(job), keys, covered: None });
+        self.ai.report_open = true;
+    }
+
+    fn stop_ai(&mut self, job: JobId) {
+        self.ai.handle.stop(job);
+        if let Some(t) = self.ai.text_mut(job) {
+            t.state = AiState::Stopped;
+        }
+    }
+
+    fn open_ai_settings(&mut self) {
+        self.ai.settings_open = true;
+        self.check_models();
+    }
+
+    fn check_models(&mut self) {
+        self.ai.checking_models = true;
+        self.ai.handle.send(AiCommand::ListModels { url: self.config.ollama.url.clone() });
+    }
+
+    fn drain_ai_events(&mut self) {
+        while let Ok(event) = self.ai.handle.rx.try_recv() {
+            match event {
+                AiEvent::Models(models) => {
+                    self.ai.checking_models = false;
+                    self.ai.models = Some(models);
+                }
+                AiEvent::Started { job, model, covered } => {
+                    if let Some(r) = self.ai.report.as_mut().filter(|r| r.ai.job == job) {
+                        r.covered = covered;
+                    }
+                    if let Some(t) = self.ai.text_mut(job)
+                        && t.state == AiState::Waiting
+                    {
+                        t.model = model;
+                        t.state = AiState::Writing;
+                    }
+                }
+                AiEvent::Chunk { job, text } => {
+                    if let Some(t) = self.ai.text_mut(job)
+                        && t.state == AiState::Writing
+                    {
+                        t.text.push_str(&text);
+                    }
+                }
+                AiEvent::Finished { job, error } => {
+                    if let Some(t) = self.ai.text_mut(job)
+                        && t.active()
+                    {
+                        t.state = match error {
+                            Some(e) => AiState::Failed(e),
+                            None => AiState::Done,
+                        };
+                    }
+                }
+            }
+        }
     }
 
     /// Move one INBOX message to Trash and select the next one in the view.
@@ -985,6 +1172,23 @@ impl GatekeepApp {
                     self.wipe = Some(WipeConfirm { account, typed: String::new() });
                 }
             }
+            ui.separator();
+            let listed = self.inbox.visible().len();
+            if ui
+                .add_enabled(listed > 0, egui::Button::new(format!("✨ Report on {listed} listed")))
+                .on_hover_text("Ask Ollama for a briefing on every email in the list")
+                .on_disabled_hover_text("No emails listed")
+                .clicked()
+            {
+                // Reopening shows the last report; "Write again" in the window makes a new one.
+                if self.ai.report.is_none() {
+                    self.start_report();
+                }
+                self.ai.report_open = true;
+            }
+            if ui.button("⚙ Ollama…").on_hover_text("Server and model used for summaries").clicked() {
+                self.open_ai_settings();
+            }
             let checked = self.inbox.checked.len();
             if checked > 0 {
                 ui.separator();
@@ -1133,6 +1337,11 @@ impl GatekeepApp {
             {
                 action = Some(PaneAction::Trash(key(msg)));
             }
+            let summary = self.ai.summaries.get(&key(msg));
+            let label = if summary.is_some() { "✨ Summarize again" } else { "✨ Summarize" };
+            if ui.button(label).on_hover_text("Ask Ollama for a short summary of this email").clicked() {
+                action = Some(PaneAction::Summarize(key(msg)));
+            }
             if let Some(from) = &msg.from {
                 if ui
                     .button("Delete all from sender")
@@ -1246,6 +1455,28 @@ impl GatekeepApp {
             .auto_shrink(false)
             .show(ui, |ui| {
                 ui.set_max_width(760.0);
+                if let Some(t) = self.ai.summaries.get(&key(msg)) {
+                    theme::card(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.strong("✨ Summary");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if t.active() {
+                                    if ui.small_button("Stop").clicked() {
+                                        action = Some(PaneAction::StopAi(t.job));
+                                    }
+                                } else if !t.text.is_empty() && ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(ollama::tidy(&t.text));
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        if ai_text_ui(ui, t) {
+                            action = Some(PaneAction::AiSettings);
+                        }
+                    });
+                    ui.add_space(10.0);
+                }
                 if msg.body.trim().is_empty() {
                     ui.weak(format!(
                         "No text body was downloaded. Messages over 1 MB (usually large attachments) are listed from their headers only; open it in {} to read it.",
@@ -1466,6 +1697,157 @@ impl GatekeepApp {
         }
     }
 
+    fn report_window(&mut self, ctx: &egui::Context) {
+        if !self.ai.report_open {
+            return;
+        }
+        let Some(report) = &self.ai.report else {
+            self.ai.report_open = false;
+            return;
+        };
+        let mut open = true;
+        let (mut rewrite, mut stop, mut settings) = (false, false, false);
+        let listed_now: Vec<MsgKey> = self.inbox.visible().iter().map(|&i| key(&self.inbox.messages[i])).collect();
+        egui::Window::new("✨ Inbox report")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(480.0)
+            .show(ctx, |ui| {
+                let listed = report.keys.len();
+                let s = if listed == 1 { "" } else { "s" };
+                if let Some(covered) = report.covered.filter(|&c| c < listed) {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "Covers the newest {covered} of the {listed} emails listed; the rest didn't fit in the model's context. \
+                             Narrow the list (or summarize some emails first) to include more."
+                        ),
+                    );
+                } else {
+                    ui.weak(format!("Covers the {listed} email{s} that were listed."));
+                }
+                ui.horizontal(|ui| {
+                    if report.ai.active() {
+                        stop = ui.button("Stop").clicked();
+                    } else {
+                        rewrite = ui
+                            .button(format!("⟳ Write again ({} listed)", listed_now.len()))
+                            .on_hover_text("Write a new report on the emails listed now")
+                            .clicked();
+                        if !report.ai.text.is_empty() && ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(ollama::tidy(&report.ai.text));
+                        }
+                    }
+                    if listed_now != report.keys {
+                        ui.weak("The list has changed since.");
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    settings = ai_text_ui(ui, &report.ai);
+                });
+            });
+        let job = report.ai.job;
+        self.ai.report_open = open;
+        if stop {
+            self.stop_ai(job);
+        }
+        if rewrite {
+            self.start_report();
+        }
+        if settings {
+            self.open_ai_settings();
+        }
+    }
+
+    fn ai_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.ai.settings_open;
+        let (mut save, mut check) = (false, false);
+        egui::Window::new("Ollama settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.label("Summaries and reports are written by Ollama, which runs AI models on your own computer.");
+                ui.weak("Email text is sent only to the server below. Keep it on this computer (localhost) to keep your mail private.");
+                ui.add_space(6.0);
+                let o = &mut self.config.ollama;
+                egui::Grid::new("ollama_settings").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Server");
+                    let url = ui.add(egui::TextEdit::singleline(&mut o.url).hint_text(ollama::DEFAULT_URL).desired_width(260.0));
+                    if url.lost_focus() {
+                        if o.url.trim().is_empty() {
+                            o.url = ollama::DEFAULT_URL.into();
+                        }
+                        save = true;
+                        check = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Model");
+                    ui.horizontal(|ui| {
+                        let installed = match &self.ai.models {
+                            Some(Ok(m)) => m.clone(),
+                            _ => Vec::new(),
+                        };
+                        let first = "First installed";
+                        let before = o.model.clone();
+                        egui::ComboBox::from_id_salt("ollama_model")
+                            .selected_text(if o.model.is_empty() { first } else { o.model.as_str() })
+                            .width(220.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut o.model, String::new(), first);
+                                for m in &installed {
+                                    ui.selectable_value(&mut o.model, m.clone(), m);
+                                }
+                            });
+                        save |= o.model != before;
+                        check |= ui.small_button("⟳").on_hover_text("Check the installed models again").clicked();
+                    });
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                if self.ai.checking_models {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Checking Ollama…");
+                    });
+                } else {
+                    match &self.ai.models {
+                        Some(Ok(m)) if m.is_empty() => {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "Ollama is running but has no models. Install one in a terminal, e.g. `ollama pull llama3.2`.",
+                            );
+                        }
+                        Some(Ok(m)) => {
+                            if !o.model.is_empty() && !m.contains(&o.model) {
+                                ui.colored_label(ui.visuals().warn_fg_color, format!("{} isn't installed.", o.model));
+                            } else {
+                                let s = if m.len() == 1 { "" } else { "s" };
+                                ui.weak(format!("✔ Connected. {} model{s} installed.", m.len()));
+                            }
+                        }
+                        Some(Err(e)) => {
+                            ui.colored_label(ui.visuals().error_fg_color, e);
+                            ui.hyperlink_to("Get Ollama ↗", "https://ollama.com/download");
+                        }
+                        None => {}
+                    }
+                }
+            });
+        self.ai.settings_open = open;
+        if save {
+            self.save_config();
+        }
+        if check {
+            self.check_models();
+        }
+    }
+
     /// Locks the UI while blocked mail is being cleaned up, with a progress bar.
     fn sweep_window(&self, ctx: &egui::Context) {
         let Some(sweep) = &self.sweep else { return };
@@ -1608,9 +1990,14 @@ impl GatekeepApp {
                 Ok(s) => self.blocked.confirm = Some(s),
                 Err(e) => self.push_error(e.to_string()),
             },
+            Some(PaneAction::Summarize(k)) => self.summarize(k),
+            Some(PaneAction::StopAi(job)) => self.stop_ai(job),
+            Some(PaneAction::AiSettings) => self.open_ai_settings(),
             None => {}
         }
         let ctx = ui.ctx().clone();
+        self.report_window(&ctx);
+        self.ai_settings_window(&ctx);
         self.delete_window(&ctx);
         self.blocked_window(&ctx);
         self.block_confirm_window(&ctx);
@@ -1714,6 +2101,37 @@ fn short_date(d: DateTime<Local>) -> String {
     }
 }
 
+/// A summary or report as it streams in. True if "Ollama settings…" was clicked.
+fn ai_text_ui(ui: &mut egui::Ui, t: &AiText) -> bool {
+    if !t.text.is_empty() {
+        ui.add(egui::Label::new(ollama::tidy(&t.text)).wrap().selectable(true));
+    }
+    match &t.state {
+        AiState::Waiting => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Waiting for Ollama… The first request can take a while as the model loads.");
+            });
+        }
+        AiState::Writing => {
+            ui.spinner();
+        }
+        AiState::Done => {
+            ui.add_space(4.0);
+            ui.weak(format!("Written by {} with Ollama. AI can get details wrong.", t.model))
+                .on_hover_text("Check the email itself before acting on it");
+        }
+        AiState::Stopped => {
+            ui.weak("Stopped.");
+        }
+        AiState::Failed(e) => {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+            return ui.link("Ollama settings…").clicked();
+        }
+    }
+    false
+}
+
 fn join(addrs: &[crate::model::Address]) -> String {
     addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
 }
@@ -1721,6 +2139,7 @@ fn join(addrs: &[crate::model::Address]) -> String {
 impl eframe::App for GatekeepApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.drain_ai_events();
         self.auto_refresh(ui.ctx());
         if self.sweep.is_some() {
             // The progress modal blocks the mouse; drop key presses too so
